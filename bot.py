@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Bot Telegram - Sistema de Búsqueda con Créditos
+Autor: Tu Nombre
+Descripción: Bot con sistema de créditos, auto-registro de usuarios y comandos
+"""
+
 import os
 import logging
-import asyncio
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
+from telegram.constants import ParseMode
 
 load_dotenv()
 
+# ==================== CONFIGURACIÓN ====================
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID'))
+CHANNEL_ID = int(os.getenv('CHANNEL_ID'))
 DATABASE_URL = os.getenv('DATABASE_URL')
+PRICE_PER_SEARCH = int(os.getenv('PRICE_PER_SEARCH', '5'))
+INITIAL_CREDITS = 100  # Créditos iniciales para nuevos usuarios
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 # ==================== BASE DE DATOS ====================
 class Database:
@@ -26,86 +35,89 @@ class Database:
         self.init_db()
 
     def get_connection(self):
+        """Obtiene conexión a PostgreSQL"""
         return psycopg2.connect(DATABASE_URL)
 
     def init_db(self):
+        """Inicializa las tablas de la base de datos"""
         conn = self.get_connection()
         cur = conn.cursor()
-
-        # PREMIUM: Usuarios con créditos
+        
+        # Tabla de usuarios
         cur.execute('''CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
             username TEXT,
-            chat_id BIGINT,
-            credits INT DEFAULT 0,
+            first_name TEXT,
+            last_name TEXT,
+            credits INT DEFAULT 100,
             expiry_date TIMESTAMP,
             created_at TIMESTAMP DEFAULT NOW(),
             is_active BOOLEAN DEFAULT TRUE
         )''')
 
-        # GRUPOS/CANALES AUTORIZADOS
-        cur.execute('''CREATE TABLE IF NOT EXISTS authorized_chats (
-            chat_id BIGINT PRIMARY KEY,
-            chat_title TEXT,
-            is_active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP DEFAULT NOW()
-        )''')
-
-        # FREE: Control de búsquedas por usuario-grupo
-        cur.execute('''CREATE TABLE IF NOT EXISTS free_users (
+        # Tabla de búsquedas (logs)
+        cur.execute('''CREATE TABLE IF NOT EXISTS searches (
             id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            chat_id BIGINT,
-            daily_searches_today INT DEFAULT 0,
-            last_search TIMESTAMP,
-            UNIQUE(user_id, chat_id)
-        )''')
-
-        # CONFIG POR GRUPO PARA USUARIOS FREE
-        cur.execute('''CREATE TABLE IF NOT EXISTS free_config (
-            chat_id BIGINT PRIMARY KEY,
-            daily_limit INT DEFAULT 3,
-            spam_delay INT DEFAULT 60,
-            created_at TIMESTAMP DEFAULT NOW()
-        )''')
-
-        # LOG DE BÚSQUEDAS
-        cur.execute('''CREATE TABLE IF NOT EXISTS search_logs (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            chat_id BIGINT,
+            user_id BIGINT REFERENCES users(user_id),
             search_term TEXT,
-            search_type VARCHAR(10),
+            results_count INT,
+            credits_used INT,
             created_at TIMESTAMP DEFAULT NOW()
         )''')
 
+        # Tabla de configuración
+        cur.execute('''CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )''')
+
+        # Insertar precio por defecto
+        cur.execute("""
+            INSERT INTO config (key, value) 
+            VALUES ('price_per_search', %s) 
+            ON CONFLICT (key) DO UPDATE SET value = %s
+        """, (str(PRICE_PER_SEARCH), str(PRICE_PER_SEARCH)))
+        
         conn.commit()
         cur.close()
         conn.close()
+        logger.info("✓ Base de datos inicializada")
 
-    # ===== USUARIOS PREMIUM =====
-    def add_premium_user(self, user_id, username, chat_id, credits, days):
+    def user_exists(self, user_id):
+        """Verifica si un usuario existe"""
+        conn = self.get_connection()
+        cur = conn.cursor()
+        cur.execute('SELECT user_id FROM users WHERE user_id = %s', (user_id,))
+        exists = cur.fetchone() is not None
+        cur.close()
+        conn.close()
+        return exists
+
+    def register_user(self, user_id, username, first_name, last_name, credits=100, days=30):
+        """Registra un nuevo usuario en la base de datos"""
         conn = self.get_connection()
         cur = conn.cursor()
         expiry = datetime.now() + timedelta(days=days)
-        cur.execute('''INSERT INTO users (user_id, username, chat_id, credits, expiry_date, is_active)
-                       VALUES (%s, %s, %s, %s, %s, TRUE)
-                       ON CONFLICT (user_id) DO UPDATE
-                       SET credits = %s, expiry_date = %s, chat_id = %s, is_active = TRUE''',
-                    (user_id, username, chat_id, credits, expiry, credits, expiry, chat_id))
-        conn.commit()
-        cur.close()
-        conn.close()
+        
+        try:
+            cur.execute('''
+                INSERT INTO users (user_id, username, first_name, last_name, credits, expiry_date, is_active)
+                VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                ON CONFLICT (user_id) DO UPDATE 
+                SET credits = %s, expiry_date = %s, is_active = TRUE
+            ''', (user_id, username, first_name, last_name, credits, expiry, credits, expiry))
+            conn.commit()
+            logger.info(f"✓ Usuario registrado: {user_id} (@{username})")
+            return True
+        except Exception as e:
+            logger.error(f"Error al registrar usuario: {e}")
+            return False
+        finally:
+            cur.close()
+            conn.close()
 
-    def remove_premium_user(self, user_id):
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute('UPDATE users SET is_active = FALSE WHERE user_id = %s', (user_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-
-    def get_premium_user(self, user_id):
+    def get_user(self, user_id):
+        """Obtiene información del usuario"""
         conn = self.get_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute('SELECT * FROM users WHERE user_id = %s', (user_id,))
@@ -114,453 +126,542 @@ class Database:
         conn.close()
         return user
 
-    def deduct_premium_credits(self, user_id, amount):
+    def deduct_credits(self, user_id, amount):
+        """Deduce créditos de un usuario"""
         conn = self.get_connection()
         cur = conn.cursor()
-        cur.execute('UPDATE users SET credits = credits - %s WHERE user_id = %s', (amount, user_id))
+        cur.execute('UPDATE users SET credits = credits - %s WHERE user_id = %s', 
+                   (amount, user_id))
         conn.commit()
         cur.close()
         conn.close()
 
-    def add_premium_credits(self, user_id, amount):
+    def add_credits(self, user_id, amount):
+        """Agrega créditos a un usuario"""
         conn = self.get_connection()
         cur = conn.cursor()
-        cur.execute('UPDATE users SET credits = credits + %s WHERE user_id = %s', (amount, user_id))
+        cur.execute('UPDATE users SET credits = credits + %s WHERE user_id = %s', 
+                   (amount, user_id))
         conn.commit()
         cur.close()
         conn.close()
 
-    # ===== GRUPOS/CANALES =====
-    def authorize_chat(self, chat_id, chat_title):
+    def remove_user(self, user_id):
+        """Desactiva un usuario"""
         conn = self.get_connection()
         cur = conn.cursor()
-        cur.execute('''INSERT INTO authorized_chats (chat_id, chat_title, is_active)
-                       VALUES (%s, %s, TRUE)
-                       ON CONFLICT (chat_id) DO UPDATE SET chat_title = %s, is_active = TRUE''',
-                    (chat_id, chat_title, chat_title))
+        cur.execute('UPDATE users SET is_active = FALSE WHERE user_id = %s', 
+                   (user_id,))
         conn.commit()
         cur.close()
         conn.close()
 
-    def deauthorize_chat(self, chat_id):
+    def set_price(self, price):
+        """Actualiza el precio por búsqueda"""
         conn = self.get_connection()
         cur = conn.cursor()
-        cur.execute('UPDATE authorized_chats SET is_active = FALSE WHERE chat_id = %s', (chat_id,))
+        cur.execute("UPDATE config SET value = %s WHERE key = 'price_per_search'", 
+                   (str(price),))
         conn.commit()
         cur.close()
         conn.close()
 
-    def is_chat_authorized(self, chat_id):
+    def get_price(self):
+        """Obtiene el precio actual por búsqueda"""
         conn = self.get_connection()
         cur = conn.cursor()
-        cur.execute('SELECT is_active FROM authorized_chats WHERE chat_id = %s', (chat_id,))
+        cur.execute("SELECT value FROM config WHERE key = 'price_per_search'")
         result = cur.fetchone()
         cur.close()
         conn.close()
-        return result[0] if result else False
+        return int(result[0]) if result else PRICE_PER_SEARCH
 
-    # ===== USUARIOS FREE =====
-    def get_free_user(self, user_id, chat_id):
-        conn = self.get_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute('SELECT * FROM free_users WHERE user_id = %s AND chat_id = %s', (user_id, chat_id))
-        user = cur.fetchone()
-        cur.close()
-        conn.close()
-        return user
-
-    def update_free_search(self, user_id, chat_id, searches_today):
+    def log_search(self, user_id, search_term, results_count):
+        """Registra una búsqueda en la base de datos"""
         conn = self.get_connection()
         cur = conn.cursor()
-        cur.execute('''INSERT INTO free_users (user_id, chat_id, daily_searches_today, last_search)
-                       VALUES (%s, %s, %s, NOW())
-                       ON CONFLICT (user_id, chat_id) DO UPDATE
-                       SET daily_searches_today = %s, last_search = NOW()''',
-                    (user_id, chat_id, searches_today, searches_today))
-        conn.commit()
-        cur.close()
-        conn.close()
-
-    def reset_free_daily_chat(self, chat_id):
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute('UPDATE free_users SET daily_searches_today = 0 WHERE chat_id = %s', (chat_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-
-    def reset_free_user(self, user_id, chat_id):
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute('UPDATE free_users SET daily_searches_today = 0 WHERE user_id = %s AND chat_id = %s', 
-                   (user_id, chat_id))
-        conn.commit()
-        cur.close()
-        conn.close()
-
-    # ===== CONFIG FREE =====
-    def get_free_config(self, chat_id):
-        conn = self.get_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute('SELECT * FROM free_config WHERE chat_id = %s', (chat_id,))
-        config = cur.fetchone()
-        if not config:
-            cur.execute('''INSERT INTO free_config (chat_id, daily_limit, spam_delay)
-                          VALUES (%s, 3, 60)''', (chat_id,))
-            conn.commit()
-            config = {'daily_limit': 3, 'spam_delay': 60}
-        cur.close()
-        conn.close()
-        return config
-
-    def set_free_config(self, chat_id, daily_limit, spam_delay):
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute('''INSERT INTO free_config (chat_id, daily_limit, spam_delay)
-                       VALUES (%s, %s, %s)
-                       ON CONFLICT (chat_id) DO UPDATE
-                       SET daily_limit = %s, spam_delay = %s''',
-                    (chat_id, daily_limit, spam_delay, daily_limit, spam_delay))
-        conn.commit()
-        cur.close()
-        conn.close()
-
-    # ===== LOGS =====
-    def log_search(self, user_id, chat_id, search_term, search_type):
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute('''INSERT INTO search_logs (user_id, chat_id, search_term, search_type)
-                       VALUES (%s, %s, %s, %s)''',
-                    (user_id, chat_id, search_term, search_type))
+        cur.execute('''
+            INSERT INTO searches (user_id, search_term, results_count, credits_used)
+            VALUES (%s, %s, %s, %s)
+        ''', (user_id, search_term, results_count, self.get_price()))
         conn.commit()
         cur.close()
         conn.close()
 
     def get_stats(self):
+        """Obtiene estadísticas del sistema"""
         conn = self.get_connection()
         cur = conn.cursor()
         cur.execute('SELECT COUNT(*) FROM users WHERE is_active = TRUE')
-        premium_users = cur.fetchone()[0]
-        cur.execute('SELECT COUNT(*) FROM authorized_chats WHERE is_active = TRUE')
-        authorized_chats = cur.fetchone()[0]
-        cur.execute('SELECT COUNT(*) FROM free_users')
-        free_users = cur.fetchone()[0]
-        cur.execute('SELECT COUNT(*) FROM search_logs WHERE DATE(created_at) = CURRENT_DATE')
-        searches_today = cur.fetchone()[0]
+        user_count = cur.fetchone()[0]
+        cur.execute('SELECT COUNT(*) FROM searches WHERE DATE(created_at) = CURRENT_DATE')
+        search_count = cur.fetchone()[0]
         cur.close()
         conn.close()
-        return {
-            'premium_users': premium_users,
-            'authorized_chats': authorized_chats,
-            'free_users': free_users,
-            'searches_today': searches_today
-        }
-
+        return user_count, search_count
 
 db = Database()
 
+# ==================== COMANDOS DE USUARIO ====================
 
-# ==================== COMANDOS USUARIO ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
+    """Comando /start - Registro automático y bienvenida"""
+    user = update.effective_user
+    user_id = user.id
+    username = user.username or "Sin usuario"
+    first_name = user.first_name or "Usuario"
+    last_name = user.last_name or ""
 
-    authorized = db.is_chat_authorized(chat_id)
-    premium_user = db.get_premium_user(user_id)
+    # Verificar si el usuario ya está registrado
+    existing_user = db.get_user(user_id)
 
-    msg = f"🤖 Bot en: {update.effective_chat.title or 'PM'}\n\n"
+    if not existing_user:
+        # Registrar nuevo usuario
+        db.register_user(
+            user_id=user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            credits=INITIAL_CREDITS,
+            days=30
+        )
+        user_info = db.get_user(user_id)
+        
+        # Mensaje de bienvenida para nuevo usuario
+        welcome_msg = f"""
+🎉 <b>¡Bienvenido {first_name}!</b>
 
-    if premium_user and premium_user['is_active']:
-        if premium_user['expiry_date'] and datetime.now() <= premium_user['expiry_date']:
-            dias = (premium_user['expiry_date'] - datetime.now()).days
-            msg += f"💎 PREMIUM: {premium_user['credits']} créditos\n"
-            msg += f"📅 Expira en: {dias} días\n\n"
-        else:
-            msg += "⏰ PREMIUM expirado\n\n"
+Has sido registrado automáticamente en el sistema.
 
-    if authorized:
-        config = db.get_free_config(chat_id)
-        msg += f"✅ Grupo autorizado\n"
-        msg += f"FREE: {config['daily_limit']}/día, spam {config['spam_delay']}s\n\n"
+👤 <b>Tu Información:</b>
+🔑 ID: <code>{user_id}</code>
+👤 Usuario: @{username}
+💳 Créditos Iniciales: {INITIAL_CREDITS}
+📅 Acceso por: 30 días
 
-    msg += "🔍 /live <palabra> - Buscar"
-    await update.message.reply_text(msg)
+📋 <b>Comandos Disponibles:</b>
+/cmds - Ver todos los comandos
+/creditos - Ver tus créditos
+/perfil - Ver tu información
+/live - Buscar en el canal
 
-
-async def creditos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = db.get_premium_user(user_id)
-
-    if not user or not user['is_active']:
-        await update.message.reply_text("❌ No eres PREMIUM")
-        return
-
-    if user['expiry_date'] and datetime.now() > user['expiry_date']:
-        await update.message.reply_text("⏰ Acceso PREMIUM expirado")
-        return
-
-    await update.message.reply_text(f"💳 Créditos: {user['credits']}")
-
-
-async def perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = db.get_premium_user(user_id)
-
-    if not user:
-        await update.message.reply_text("❌ No registrado")
-        return
-
-    if user['expiry_date']:
-        dias = (user['expiry_date'] - datetime.now()).days
-        expiry_str = f"{dias} días" if dias > 0 else "Expirado"
+¿Necesitas ayuda? Escribe /cmds
+        """
     else:
-        expiry_str = "N/A"
-
-    await update.message.reply_text(
-        f"👤 Perfil\n"
-        f"ID: {user_id}\n"
-        f"💳 Créditos: {user['credits']}\n"
-        f"📅 PREMIUM: {expiry_str}\n"
-        f"✅ Estado: {'Activo' if user['is_active'] else 'Inactivo'}"
-    )
-
-
-async def live_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-
-    if not context.args:
-        await update.message.reply_text("❌ Uso: /live <palabra>")
-        return
-
-    search_term = " ".join(context.args)
-
-    # CHECK PREMIUM PRIMERO
-    premium_user = db.get_premium_user(user_id)
-    if premium_user and premium_user['is_active'] and premium_user['expiry_date']:
-        if datetime.now() <= premium_user['expiry_date']:
-            # PREMIUM USUARIO
-            price = 5
-            if premium_user['credits'] < price:
-                await update.message.reply_text(f"❌ Créditos insuficientes ({premium_user['credits']}/{price})")
-                return
-
-            db.deduct_premium_credits(user_id, price)
-            db.log_search(user_id, chat_id, search_term, 'PREMIUM')
-            
+        # Usuario ya existe
+        expiry = datetime.fromisoformat(str(existing_user['expiry_date']))
+        
+        if not existing_user['is_active']:
             await update.message.reply_text(
-                f"💎 PREMIUM: Buscando '{search_term}'...\n"
-                f"📍 Resultados simulados\n"
-                f"💳 Gastaste {price} créditos\n"
-                f"💳 Restante: {premium_user['credits'] - price}"
+                "❌ Tu acceso ha sido desactivado.\n"
+                "Contacta al administrador.",
+                parse_mode=ParseMode.HTML
             )
             return
 
-    # CHECK FREE
-    authorized = db.is_chat_authorized(chat_id)
-    if not authorized:
-        await update.message.reply_text("❌ Grupo no autorizado")
-        return
-
-    config = db.get_free_config(chat_id)
-    free_user = db.get_free_user(user_id, chat_id)
-
-    # Anti-spam
-    if free_user and free_user['last_search']:
-        elapsed = (datetime.now() - free_user['last_search']).total_seconds()
-        if elapsed < config['spam_delay']:
-            remaining = int(config['spam_delay'] - elapsed)
-            await update.message.reply_text(f"⏳ Espera {remaining}s (anti-spam)")
+        if datetime.now() > expiry:
+            await update.message.reply_text(
+                "⏰ Tu acceso ha expirado.\n"
+                "Contacta al administrador para renovar.",
+                parse_mode=ParseMode.HTML
+            )
             return
 
-    # Límite diario
-    if free_user and free_user['daily_searches_today'] >= config['daily_limit']:
+        welcome_msg = f"""
+👋 <b>¡Bienvenido de vuelta {first_name}!</b>
+
+🔑 ID: <code>{user_id}</code>
+💳 Créditos: {existing_user['credits']}
+📅 Expira: {expiry.strftime('%d/%m/%Y')}
+
+Escribe /cmds para ver los comandos disponibles
+        """
+
+    await update.message.reply_text(welcome_msg, parse_mode=ParseMode.HTML)
+
+async def cmds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /cmds - Muestra todos los comandos disponibles"""
+    user_id = update.effective_user.id
+    user = db.get_user(user_id)
+
+    if not user:
         await update.message.reply_text(
-            f"❌ Límite diario alcanzado ({config['daily_limit']}/día)\n"
-            f"Reinicia en 24h"
+            "❌ No estás registrado. Usa /start primero.",
+            parse_mode=ParseMode.HTML
         )
         return
 
-    # Procesar búsqueda FREE
-    searches_today = free_user['daily_searches_today'] + 1 if free_user else 1
-    db.update_free_search(user_id, chat_id, searches_today)
-    db.log_search(user_id, chat_id, search_term, 'FREE')
+    commands_msg = f"""
+📋 <b>COMANDOS DISPONIBLES</b>
 
-    await update.message.reply_text(
-        f"🔍 FREE: Buscando '{search_term}'...\n"
-        f"📍 Resultados simulados\n"
-        f"📊 {searches_today}/{config['daily_limit']} búsquedas hoy"
-    )
+🔍 <b>COMANDOS DE BÚSQUEDA:</b>
+/live &lt;palabra&gt; - Busca en el canal
+   Costo: {db.get_price()} créditos por búsqueda
+   Ejemplo: /live python
 
+👤 <b>COMANDOS DE USUARIO:</b>
+/start - Inicia el bot (auto-registra)
+/creditos - Ver créditos disponibles
+/perfil - Ver información de tu cuenta
+/cmds - Ver este menú de comandos
 
-# ==================== COMANDOS ADMIN ====================
-async def adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return await update.message.reply_text("❌ Solo admin")
+💬 <b>TU INFORMACIÓN ACTUAL:</b>
+🔑 ID: <code>{user_id}</code>
+👤 Usuario: @{user['username']}
+💳 Créditos: {user['credits']}
+📅 Acceso hasta: {datetime.fromisoformat(str(user['expiry_date'])).strftime('%d/%m/%Y')}
 
-    if len(context.args) < 4:
-        return await update.message.reply_text("Uso: /adduser user_id chat_id creditos dias")
+{"✅ Estado: ACTIVO" if user['is_active'] else "❌ Estado: INACTIVO"}
 
-    try:
-        user_id, chat_id, credits, days = map(int, context.args[:4])
-        db.add_premium_user(user_id, f"user_{user_id}", chat_id, credits, days)
+{"" if user_id != ADMIN_ID else f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚙️ <b>COMANDOS ADMIN:</b>
+/adduser &lt;id&gt; &lt;créditos&gt; &lt;días&gt; - Agregar usuario
+   Ejemplo: /adduser 123456789 100 30
+
+/removeuser &lt;id&gt; - Desactivar usuario
+   Ejemplo: /removeuser 123456789
+
+/setprice &lt;precio&gt; - Cambiar precio por búsqueda
+   Ejemplo: /setprice 10
+
+/addcredits &lt;id&gt; &lt;cantidad&gt; - Agregar créditos
+   Ejemplo: /addcredits 123456789 50
+
+/stats - Ver estadísticas del sistema
+"""}
+    """
+
+    await update.message.reply_text(commands_msg, parse_mode=ParseMode.HTML)
+
+async def creditos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /creditos - Ver créditos disponibles"""
+    user_id = update.effective_user.id
+    user = db.get_user(user_id)
+
+    if not user:
         await update.message.reply_text(
-            f"✅ PREMIUM agregado\n"
-            f"User: {user_id}\n"
-            f"Créditos: {credits}\n"
-            f"Días: {days}"
+            "❌ No estás registrado. Usa /start",
+            parse_mode=ParseMode.HTML
         )
-    except:
-        await update.message.reply_text("❌ Error parámetros")
+        return
 
+    price = db.get_price()
+    searches_available = user['credits'] // price
 
-async def removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return await update.message.reply_text("❌ Solo admin")
+    creditos_msg = f"""
+💳 <b>TUS CRÉDITOS</b>
+
+💰 Créditos disponibles: <b>{user['credits']}</b>
+🔍 Búsquedas disponibles: <b>{searches_available}</b>
+💵 Costo por búsqueda: <b>{price} créditos</b>
+
+{"✅ Tienes suficientes créditos para buscar" if searches_available > 0 else "❌ Insuficientes créditos. Contacta al admin"}
+
+Usa /live &lt;palabra&gt; para buscar
+    """
+
+    await update.message.reply_text(creditos_msg, parse_mode=ParseMode.HTML)
+
+async def perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /perfil - Ver información del usuario"""
+    user_id = update.effective_user.id
+    user = db.get_user(user_id)
+
+    if not user:
+        await update.message.reply_text(
+            "❌ No estás registrado. Usa /start",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    expiry = datetime.fromisoformat(str(user['expiry_date']))
+    dias_restantes = (expiry - datetime.now()).days
+
+    perfil_msg = f"""
+👤 <b>TU PERFIL</b>
+
+🔑 ID Telegram: <code>{user_id}</code>
+👤 Usuario: <b>@{user['username']}</b>
+📝 Nombre: <b>{user['first_name']} {user['last_name']}</b>
+💳 Créditos: <b>{user['credits']}</b>
+📅 Acceso expira en: <b>{dias_restantes} días</b>
+📆 Fecha expiración: {expiry.strftime('%d/%m/%Y %H:%M')}
+📝 Miembro desde: {datetime.fromisoformat(str(user['created_at'])).strftime('%d/%m/%Y')}
+✅ Estado: <b>{"ACTIVO" if user['is_active'] else "INACTIVO"}</b>
+    """
+
+    await update.message.reply_text(perfil_msg, parse_mode=ParseMode.HTML)
+
+async def live_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /live - Buscar en el canal"""
+    user_id = update.effective_user.id
+    user = db.get_user(user_id)
+
+    if not user:
+        await update.message.reply_text(
+            "❌ No estás registrado. Usa /start",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if not user['is_active']:
+        await update.message.reply_text(
+            "❌ Tu acceso ha sido desactivado.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    expiry = datetime.fromisoformat(str(user['expiry_date']))
+    if datetime.now() > expiry:
+        await update.message.reply_text(
+            "⏰ Tu acceso ha expirado. Contacta al administrador.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    price = db.get_price()
+    if user['credits'] < price:
+        await update.message.reply_text(
+            f"❌ Créditos insuficientes.\n"
+            f"Necesitas: {price} créditos\n"
+            f"Tienes: {user['credits']} créditos\n\n"
+            f"Contacta al administrador para agregar créditos.",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
     if not context.args:
-        return await update.message.reply_text("Uso: /removeuser user_id")
+        await update.message.reply_text(
+            "❌ Uso correcto: /live &lt;palabra clave&gt;\n"
+            "Ejemplo: /live python",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    search_term = ' '.join(context.args)
+
+    await update.message.reply_text(
+        f"🔍 Buscando '{search_term}' en el canal...",
+        parse_mode=ParseMode.HTML
+    )
+
+    try:
+        # Aquí irá la lógica para buscar en el canal
+        # Por ahora simulamos la búsqueda
+        
+        db.deduct_credits(user_id, price)
+        db.log_search(user_id, search_term, 0)
+
+        remaining_credits = user['credits'] - price
+
+        search_result = f"""
+✅ <b>Búsqueda Completada</b>
+
+🔍 Término: <b>{search_term}</b>
+📍 Resultados: Se está procesando...
+💳 Créditos usados: <b>{price}</b>
+💰 Créditos restantes: <b>{remaining_credits}</b>
+
+Puedes hacer {remaining_credits // price} búsquedas más con tus créditos actuales.
+        """
+
+        await update.message.reply_text(search_result, parse_mode=ParseMode.HTML)
+
+    except Exception as e:
+        logger.error(f"Error en búsqueda: {e}")
+        # Devolver créditos en caso de error
+        db.add_credits(user_id, price)
+        await update.message.reply_text(
+            f"❌ Error en la búsqueda: {str(e)}",
+            parse_mode=ParseMode.HTML
+        )
+
+# ==================== COMANDOS ADMIN ====================
+
+async def adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /adduser - Agregar usuario (SOLO ADMIN)"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text(
+            "❌ Solo el administrador puede usar este comando.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "❌ Uso: /adduser &lt;user_id&gt; &lt;créditos&gt; &lt;días&gt;\n"
+            "Ejemplo: /adduser 123456789 100 30",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
     try:
         user_id = int(context.args[0])
-        db.remove_premium_user(user_id)
-        await update.message.reply_text(f"✅ Usuario {user_id} desactivado")
-    except:
-        await update.message.reply_text("❌ Error")
+        credits = int(context.args[1])
+        days = int(context.args[2])
 
-
-async def authorize(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return await update.message.reply_text("❌ Solo admin")
-
-    if not context.args:
-        return await update.message.reply_text("Uso: /authorize chat_id [nombre]")
-
-    try:
-        chat_id = int(context.args[0])
-        chat_title = context.args[1] if len(context.args) > 1 else f"Chat_{chat_id}"
-        db.authorize_chat(chat_id, chat_title)
-        await update.message.reply_text(f"✅ Grupo {chat_id} autorizado")
-    except:
-        await update.message.reply_text("❌ Error")
-
-
-async def deauthorize(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return await update.message.reply_text("❌ Solo admin")
-
-    if not context.args:
-        return await update.message.reply_text("Uso: /deauthorize chat_id")
-
-    try:
-        chat_id = int(context.args[0])
-        db.deauthorize_chat(chat_id)
-        await update.message.reply_text(f"✅ Grupo {chat_id} desautorizado")
-    except:
-        await update.message.reply_text("❌ Error")
-
-
-async def freeconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return await update.message.reply_text("❌ Solo admin")
-
-    if len(context.args) < 3:
-        return await update.message.reply_text("Uso: /freeconfig chat_id limite_diario spam_segundos")
-
-    try:
-        chat_id, daily_limit, spam_delay = map(int, context.args[:3])
-        db.set_free_config(chat_id, daily_limit, spam_delay)
-        await update.message.reply_text(
-            f"✅ Config FREE actualizada\n"
-            f"Grupo: {chat_id}\n"
-            f"Límite: {daily_limit}/día\n"
-            f"Spam: {spam_delay}s"
+        db.register_user(
+            user_id=user_id,
+            username=f"user_{user_id}",
+            first_name="Agregado",
+            last_name="por Admin",
+            credits=credits,
+            days=days
         )
-    except:
-        await update.message.reply_text("❌ Error parámetros")
 
+        await update.message.reply_text(
+            f"✅ <b>Usuario Agregado</b>\n"
+            f"🔑 ID: <code>{user_id}</code>\n"
+            f"💳 Créditos: {credits}\n"
+            f"📅 Acceso: {days} días",
+            parse_mode=ParseMode.HTML
+        )
 
-async def resetfree(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Los argumentos deben ser números.",
+            parse_mode=ParseMode.HTML
+        )
+
+async def removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /removeuser - Eliminar usuario (SOLO ADMIN)"""
     if update.effective_user.id != ADMIN_ID:
-        return await update.message.reply_text("❌ Solo admin")
+        await update.message.reply_text(
+            "❌ Solo el administrador.",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
     if not context.args:
-        return await update.message.reply_text("Uso: /resetfree chat_id")
+        await update.message.reply_text(
+            "❌ Uso: /removeuser &lt;user_id&gt;",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
     try:
-        chat_id = int(context.args[0])
-        db.reset_free_daily_chat(chat_id)
-        await update.message.reply_text(f"✅ Búsquedas FREE reseteadas grupo {chat_id}")
-    except:
-        await update.message.reply_text("❌ Error")
-
-
-async def addcredits(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return await update.message.reply_text("❌ Solo admin")
-
-    if len(context.args) < 2:
-        return await update.message.reply_text("Uso: /addcredits user_id cantidad")
-
-    try:
-        user_id, amount = map(int, context.args[:2])
-        db.add_premium_credits(user_id, amount)
-        await update.message.reply_text(f"✅ {amount} créditos agregados a {user_id}")
-    except:
-        await update.message.reply_text("❌ Error")
-
+        user_id = int(context.args[0])
+        db.remove_user(user_id)
+        await update.message.reply_text(
+            f"✅ Usuario {user_id} desactivado.",
+            parse_mode=ParseMode.HTML
+        )
+    except ValueError:
+        await update.message.reply_text(
+            "❌ ID inválido.",
+            parse_mode=ParseMode.HTML
+        )
 
 async def setprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /setprice - Cambiar precio (SOLO ADMIN)"""
     if update.effective_user.id != ADMIN_ID:
-        return await update.message.reply_text("❌ Solo admin")
+        await update.message.reply_text(
+            "❌ Solo el administrador.",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
     if not context.args:
-        return await update.message.reply_text("Uso: /setprice precio")
+        await update.message.reply_text(
+            "❌ Uso: /setprice &lt;nuevo_precio&gt;",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
     try:
-        price = int(context.args[0])
-        # Guardar en config si necesitas persistencia
-        await update.message.reply_text(f"✅ Precio PREMIUM: {price} créditos/búsqueda")
-    except:
-        await update.message.reply_text("❌ Error")
+        new_price = int(context.args[0])
+        db.set_price(new_price)
+        await update.message.reply_text(
+            f"✅ Precio actualizado a {new_price} créditos por búsqueda.",
+            parse_mode=ParseMode.HTML
+        )
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Precio inválido.",
+            parse_mode=ParseMode.HTML
+        )
 
+async def addcredits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /addcredits - Agregar créditos (SOLO ADMIN)"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text(
+            "❌ Solo el administrador.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ Uso: /addcredits &lt;user_id&gt; &lt;cantidad&gt;",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    try:
+        user_id = int(context.args[0])
+        amount = int(context.args[1])
+        db.add_credits(user_id, amount)
+        user = db.get_user(user_id)
+        await update.message.reply_text(
+            f"✅ Se agregaron {amount} créditos a usuario {user_id}\n"
+            f"Créditos actuales: {user['credits']}",
+            parse_mode=ParseMode.HTML
+        )
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Argumentos inválidos.",
+            parse_mode=ParseMode.HTML
+        )
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /stats - Ver estadísticas (SOLO ADMIN)"""
     if update.effective_user.id != ADMIN_ID:
-        return await update.message.reply_text("❌ Solo admin")
+        await update.message.reply_text(
+            "❌ Solo el administrador.",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
-    stats = db.get_stats()
-    await update.message.reply_text(
-        f"📊 ESTADÍSTICAS\n\n"
-        f"💎 PREMIUM: {stats['premium_users']} usuarios\n"
-        f"✅ Grupos autorizados: {stats['authorized_chats']}\n"
-        f"👥 FREE activos: {stats['free_users']}\n"
-        f"🔍 Búsquedas hoy: {stats['searches_today']}"
-    )
+    user_count, search_count = db.get_stats()
+    price = db.get_price()
 
+    stats_msg = f"""
+📊 <b>ESTADÍSTICAS DEL SISTEMA</b>
+
+👥 Usuarios activos: <b>{user_count}</b>
+🔍 Búsquedas hoy: <b>{search_count}</b>
+💳 Precio por búsqueda: <b>{price} créditos</b>
+🤖 Bot Token: {"✅ Conectado" if BOT_TOKEN else "❌ No configurado"}
+🗄️ Base de datos: {"✅ PostgreSQL Conectado" if DATABASE_URL else "❌ No configurado"}
+    """
+
+    await update.message.reply_text(stats_msg, parse_mode=ParseMode.HTML)
+
+# ==================== MAIN ====================
 
 def main():
+    """Inicia el bot"""
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Usuario
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("live", live_search))
-    app.add_handler(CommandHandler("creditos", creditos))
-    app.add_handler(CommandHandler("perfil", perfil))
+    # Comandos de usuario
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('cmds', cmds))
+    app.add_handler(CommandHandler('creditos', creditos))
+    app.add_handler(CommandHandler('perfil', perfil))
+    app.add_handler(CommandHandler('live', live_search))
 
-    # Admin
-    app.add_handler(CommandHandler("adduser", adduser))
-    app.add_handler(CommandHandler("removeuser", removeuser))
-    app.add_handler(CommandHandler("authorize", authorize))
-    app.add_handler(CommandHandler("deauthorize", deauthorize))
-    app.add_handler(CommandHandler("freeconfig", freeconfig))
-    app.add_handler(CommandHandler("resetfree", resetfree))
-    app.add_handler(CommandHandler("addcredits", addcredits))
-    app.add_handler(CommandHandler("setprice", setprice))
-    app.add_handler(CommandHandler("stats", stats))
+    # Comandos admin
+    app.add_handler(CommandHandler('adduser', adduser))
+    app.add_handler(CommandHandler('removeuser', removeuser))
+    app.add_handler(CommandHandler('setprice', setprice))
+    app.add_handler(CommandHandler('addcredits', addcredits))
+    app.add_handler(CommandHandler('stats', stats))
 
-    logger.info("🚀 Bot ULTRA iniciado!")
+    logger.info("=" * 50)
+    logger.info("🤖 Bot Telegram iniciado correctamente")
+    logger.info("=" * 50)
     app.run_polling()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
